@@ -1,0 +1,225 @@
+### **扩展练习Challenge：任意大小的内存单元slub分配算法（需要编程）**
+#### 整体思路
+slub算法是linux内核中用于分配内存单元的算法，对于整页内存的需求，可以直接使用buddy system算法获得；对于较小内存块的需求，使用slub算法将整页内存分为较小块的内存，实现零碎内存的分配和回收。
+
+在我的实现过程中，我把内存分组管理，每个组分别包含2^3、2^4、...2^11个字节，在4K页大小的默认情况下，另外还有两个特殊的组，分别是96B和192B，共11组。
+
+
+#### 结构定义
+首先，需要定义页的最大缓存大小、缓存数组以及一个页的大小，便于接下来计算每个slab内可以分配的数量
+
+```
+#define PAGE_SIZE 4096
+#define MAX_CACHE_SIZE 2048 // 最大缓存大小
+#define CACHE_COUNT 12 // 缓存组数量
+#define SLAB_MAX_COUNT 10 
+```
+然后，定义了几个**结构体**，整体使用单向链表来实现next的查询。
+* kmem_cache结构
+```
+// kmem_cache结构
+typedef struct KmemCache {
+    Slab *partial;      // 部分使用的slab
+    Slab *full;         // 完全使用的slab
+    int object_size;    // 每个对象的大小
+    Object objects[SLAB_MAX_COUNT]; // 静态数组用于对象
+} KmemCache;
+```
+* slab结构
+```
+typedef struct Slab {
+    Object *free_list;  // 空闲对象链表
+    int in_use;         // 当前使用的对象数量
+    struct Slab *next;  // 指向下一个slab
+} Slab;
+```
+* 对象结构
+```
+typedef struct Object {
+    struct Object *next;  // 指向下一个对象
+} Object;
+```
+结构体定义之后，我使用`KmemCache kmalloc_caches[CACHE_COUNT];`来实现分配12种内存情况。
+
+除此以外，我还定义了内存池来避免动态分配（即不使用malloc和free函数）
+```
+// 内存池大小
+#define POOL_SIZE (CACHE_COUNT * SLAB_MAX_COUNT * sizeof(Object))
+
+// 定义内存池
+static char memory_pool[POOL_SIZE];
+static int pool_index = 0;
+
+// 从内存池中分配内存
+void *pool_alloc(size_t size) {
+    if (pool_index + size > POOL_SIZE) {
+        return NULL; // 内存池不足
+    }
+    void *ptr = memory_pool + pool_index;
+    pool_index += size;
+    return ptr;
+}
+
+// 释放内存池中的内存（这里只是简单的重置，实际使用中需要管理）
+void pool_free() {
+    pool_index = 0; // 简单重置内存池
+}
+```
+
+#### 主要函数
+* **初始化kmem_cache**，因为定义了大小为12的一维KmemCache数组，因此需要实现每种内存大小的KmemCache的初始化。在初始化时，我首先将对象链表初始化为空，然后使用内存池来分配对象，并链接到对象链表中。
+
+```
+void kmem_cache_init() {
+    for (int i = 0; i < CACHE_COUNT; i++) {
+        if (i < 10) {
+            kmalloc_caches[i].object_size = 1 << (i + 3); // 2^3到2^11
+        } else if (i == 10) {
+            kmalloc_caches[i].object_size = 96; // 96字节
+        } else {
+            kmalloc_caches[i].object_size = 192; // 192字节
+        }
+        kmalloc_caches[i].partial = NULL;
+        kmalloc_caches[i].full = NULL;
+
+        // 初始化对象链表
+        kmalloc_caches[i].partial = pool_alloc(sizeof(Slab)); // 从内存池分配slab
+        assert(kmalloc_caches[i].partial != NULL);
+        kmalloc_caches[i].partial->free_list = NULL;
+        kmalloc_caches[i].partial->in_use = 0;
+
+        for (int j = 0; j < SLAB_MAX_COUNT; j++) {
+            Object *obj = &kmalloc_caches[i].objects[j]; // 使用静态数组
+            obj->next = kmalloc_caches[i].partial->free_list;
+            kmalloc_caches[i].partial->free_list = obj;
+        }
+    }
+    cprintf("kmalloc caches initialized.\n");
+}
+```
+* **内存分配slub_alloc**，在分配内存时，我首先判断是否需要创建新的slab，如果当前slab已经用完，则创建新的slab，并将其链接到对应的partial链表中。然后从slab的free_list中取出一个对象，并将其返回。需要注意的是，当从partial分配内存后，该slab的空间全被占满，则将该slab移至full中。
+```
+void *slub_alloc(size_t size) {
+    for (int i = 0; i < CACHE_COUNT; i++) {
+        if (kmalloc_caches[i].object_size == size) {
+            KmemCache *cache = &kmalloc_caches[i];
+            if (cache->partial) {
+                Slab *slab = cache->partial;
+
+                // 从空闲链表中取出一个对象
+                if (slab->free_list) {
+                    Object *obj = slab->free_list;
+                    slab->free_list = obj->next;
+                    slab->in_use++;
+
+                    // 如果slab满了，移到full链表
+                    if (slab->in_use == SLAB_MAX_COUNT) {
+                        slab->next = cache->full; // 移到full链表
+                        cache->full = slab;
+                        cache->partial = NULL; // 清空partial链表
+                    }
+                    return obj; // 返回对象指针
+                }
+            }
+
+            // 如果没有部分slab，则创建一个新的
+            Slab *new_slab = (Slab *)pool_alloc(sizeof(Slab)); 
+            assert(new_slab != NULL);
+            new_slab->free_list = NULL;
+            new_slab->in_use = 0;
+
+            // 初始化对象链表
+            for (int j = 0; j < SLAB_MAX_COUNT; j++) {
+                Object *obj = &kmalloc_caches[i].objects[j]; 
+                obj->next = new_slab->free_list;
+                new_slab->free_list = obj;
+            }
+
+            new_slab->next = cache->partial;
+            cache->partial = new_slab;
+
+            // 返回第一个空闲对象
+            return slub_alloc(size);
+        }
+    }
+
+    return NULL; // 如果没有匹配的大小，则返回NULL
+}
+```
+* **内存释放slub_free**，在释放内存时，找到与要被释放的空间大小一致的kmem_cache，然后找到对应的slab，并从slab的free_list中释放对象。若释放内存后，该slab中所有空间都没有被占用，则移除此slab
+```
+void slub_free(void *ptr, size_t size) {
+    for (int i = 0; i < CACHE_COUNT; i++) {
+        if (kmalloc_caches[i].object_size == size) {
+            KmemCache *cache = &kmalloc_caches[i];
+            Slab *slab = cache->partial;
+
+            // 直接释放到该slab的空闲链表
+            if (slab) {
+                Object *obj = (Object *)ptr; // 将指针转换为 Object *
+                obj->next = slab->free_list;
+                slab->free_list = obj;
+                slab->in_use--;
+
+                // 如果slab变为空，移除该slab
+                if (slab->in_use == 0) {
+                    cache->partial = NULL; // 清空partial链表
+                }
+            }
+            return;
+        }
+    }
+}
+```
+* **检查函数slub_check**,首先打印每种大小的kmem_cache的初始状态，然后为每种大小的kmem_cache分配一个对象，然后释放，以此来检查内存分配和释放的正确性。
+```
+void slub_check() {
+    cprintf("SLUB check begin\n");
+
+    for (int i = 0; i < CACHE_COUNT; i++) {
+        cprintf("Cache %d: size %d, partial slabs: %p, full slabs: %p\n",
+                i, kmalloc_caches[i].object_size, kmalloc_caches[i].partial, kmalloc_caches[i].full);
+    }
+
+    for (int i = 0; i < CACHE_COUNT; i++) {
+        void *obj = slub_alloc(kmalloc_caches[i].object_size);
+        assert(obj != NULL);
+        cprintf("Allocated object of size %d: %p\n", kmalloc_caches[i].object_size, obj);
+        slub_free(obj, kmalloc_caches[i].object_size);
+    }
+
+    destroy_kmem_cache();
+    cprintf("kmem_cache destroyed successfully\n");
+    cprintf("SLUB check end\n");
+}
+```
+运行结果：
+```
+SLUB check begin
+Cache 0: size 8, partial slabs: 0xffffffffc02054f0, full slabs: 0x0
+Cache 1: size 16, partial slabs: 0xffffffffc0205508, full slabs: 0x0
+Cache 2: size 32, partial slabs: 0xffffffffc0205520, full slabs: 0x0
+Cache 3: size 64, partial slabs: 0xffffffffc0205538, full slabs: 0x0
+Cache 4: size 128, partial slabs: 0xffffffffc0205550, full slabs: 0x0
+Cache 5: size 256, partial slabs: 0xffffffffc0205568, full slabs: 0x0
+Cache 6: size 512, partial slabs: 0xffffffffc0205580, full slabs: 0x0
+Cache 7: size 1024, partial slabs: 0xffffffffc0205598, full slabs: 0x0
+Cache 8: size 2048, partial slabs: 0xffffffffc02055b0, full slabs: 0x0
+Cache 9: size 4096, partial slabs: 0xffffffffc02055c8, full slabs: 0x0
+Cache 10: size 96, partial slabs: 0xffffffffc02055e0, full slabs: 0x0
+Cache 11: size 192, partial slabs: 0xffffffffc02055f8, full slabs: 0x0
+Allocated object of size 8: 0xffffffffc0205070
+Allocated object of size 16: 0xffffffffc02050d8
+Allocated object of size 32: 0xffffffffc0205140
+Allocated object of size 64: 0xffffffffc02051a8
+Allocated object of size 128: 0xffffffffc0205210
+Allocated object of size 256: 0xffffffffc0205278
+Allocated object of size 512: 0xffffffffc02052e0
+Allocated object of size 1024: 0xffffffffc0205348
+Allocated object of size 2048: 0xffffffffc02053b0
+Allocated object of size 4096: 0xffffffffc0205418
+Allocated object of size 96: 0xffffffffc0205480
+Allocated object of size 192: 0xffffffffc02054e8
+kmem_cache destroyed successfully
+
+```
