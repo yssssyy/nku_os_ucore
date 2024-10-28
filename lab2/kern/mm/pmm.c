@@ -1,6 +1,7 @@
 #include <default_pmm.h> // 包含默认物理内存管理器头文件
 #include <best_fit_pmm.h> // 包含最佳适配物理内存管理器头文件
 #include <slub_pmm.h> // 包含SLUB内存分配器头文件
+#include<buddy_pmm.h>//包含buddy内存分配器头文件
 #include <defs.h> // 包含定义文件
 #include <error.h> // 包含错误处理头文件
 #include <memlayout.h> // 包含内存布局头文件
@@ -33,7 +34,8 @@ static void check_alloc_page(void); // 声明检查页面分配的函数
 
 // init_pmm_manager - 初始化物理内存管理器实例
 static void init_pmm_manager(void) {
-    // pmm_manager = &best_fit_pmm_manager; // 选择最佳适配管理器（注释掉）
+    // pmm_manager = &best_fit_pmm_manager; // 选择最佳适配管理器
+    // pmm_manager = &buddy_pmm_manager;//选择buddy内存管理器
     pmm_manager = &slub_pmm_manager; // 选择SLUB内存管理器
     cprintf("memory management: %s\n", pmm_manager->name); // 打印当前内存管理器名称
     pmm_manager->init(); // 调用初始化函数
