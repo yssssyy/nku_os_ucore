@@ -371,35 +371,35 @@ do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
 // 5 把设置好的进程加入链表
 // 6 将新建的进程设为就绪态
 // 7 将返回值设为线程id
-    if ((proc = alloc_proc()) == NULL) {//分配一个 initproc（
-        goto fork_out;
-    }
-    proc->parent = current;//将子进程的父节点设置为当前进程
-
-    if(setup_kstack(proc)){//将分配到的页面映射到进程的内核栈指针
+    //1
+    proc = alloc_proc();                 // 分配新的进程结构体并初始化其字段
+    if(proc==NULL)                       // 如果进程结构体分配失败
+    {
         goto bad_fork_cleanup_proc;
     }
-
-    if(copy_mm(clone_flags,proc)){//copy_mm函数目前只是把current->mm设置为NULL，这是由于目前在实验四中只能创建内核线程，proc->mm描述的是进程用户态空间的情况，所以目前mm还用不上。
-        goto bad_fork_cleanup_kstack;
-    }
-
-    copy_thread(proc,stack,tf);
-
-    bool intr_flag;
-    //sync/sync.h
-    local_intr_save(intr_flag);//屏蔽中断，intr_flag置为1   
+    proc->parent = current;              // 设置新进程的父进程为当前进程  
+    //2             
+    if(setup_kstack(proc))               // 为新进程分配内核栈
     {
-        proc->pid = get_pid();//获取当前进程PID
-        hash_proc(proc);//建立hash映射
-        list_add(&proc_list,&(proc->list_link));//加入进程链
-        nr_process++;
+        goto bad_fork_cleanup_kstack;    // 如果内核栈分配失败，进入清理流程
+    }  
+    //3    
+    if(copy_mm(clone_flags, proc))       // 根据 clone_flags 复制或共享内存管理结构
+    {
+        goto fork_out;                   // 如果内存管理结构复制失败，跳到退出处理
     }
-    local_intr_restore(intr_flag);//恢复中断
-
-    proc->state = PROC_RUNNABLE;
-
-    ret = proc->pid;//返回当前进程的PID
+    //4
+    copy_thread(proc, stack, tf);        // 设置子进程trapframe和线程上下文
+    int pid = get_pid();                 // 分配一个唯一的进程 ID
+    proc->pid = pid;                     // 将 PID 分配给子进程
+    //5
+    hash_proc(proc);                     // 将子进程插入哈希表，便于快速查找
+    list_add(&proc_list, &(proc->list_link)); // 将子进程加入进程链表
+    nr_process++;                        // 增加全局进程计数器
+    //6
+    wakeup_proc(proc);                   // 设置子进程状态为可运行（`PROC_RUNNABLE`），在sched.c中定义
+    //7
+    ret = proc->pid;                     // 返回子进程的 PID
 //返回标签
 fork_out:
     return ret;
