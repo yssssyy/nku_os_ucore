@@ -114,7 +114,7 @@ alloc_proc(void) {
         proc->tf = NULL;
         proc->cr3 = boot_cr3;//使用内核页目录表的基址
         proc->flags = 0;
-        memset(proc->name,0,PROC_NAME_LEN+1);
+        memset(proc->name,0,PROC_NAME_LEN);
              
     }
     return proc;
